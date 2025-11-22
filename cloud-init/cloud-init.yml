@@ -1,0 +1,241 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+# 1) Najprej posodobitev in namestitev paketov
+packages:
+  - nginx
+  - postgresql
+  - postgresql-contrib
+  - redis-server
+  - git
+  - python3
+  - python3-pip
+  - python3-venv
+  - build-essential
+  - python3-dev
+  - libpq-dev
+  - curl
+  - gnupg
+  - libpango-1.0-0
+  - libpangoft2-1.0-0
+  - libcairo2
+  - libffi-dev
+  - ufw
+  - xfce4
+
+write_files:
+  # Systemd service za backend (FastAPI)
+  - path: /etc/systemd/system/reportapp.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Report App Backend (FastAPI)
+      After=network.target postgresql.service redis-server.service
+
+      [Service]
+      User=reportapp
+      WorkingDirectory=/opt/reportapp/backend/backend
+      EnvironmentFile=/etc/reportapp.env
+      Environment=MPLCONFIGDIR=/var/lib/reportapp/matplotlib
+      ExecStart=/opt/reportapp/backend/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Nginx site config – HTTP reverse proxy + Angular frontend
+  - path: /etc/nginx/sites-available/reportapp
+    permissions: "0644"
+    content: |
+      server {
+          listen 80 default_server;
+          listen [::]:80 default_server;
+
+          server_name _;
+
+          client_max_body_size 50m;
+
+          # API -> backend (FastAPI)
+          location /api/ {
+              proxy_pass http://127.0.0.1:8000;
+              proxy_set_header Host              $host;
+              proxy_set_header X-Real-IP         $remote_addr;
+              proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # FRONTEND (Angular build)
+          location / {
+              root /opt/reportapp/frontend/frontend/report-app/dist/report-app/browser;
+              index index.html;
+              try_files $uri $uri/ /index.html;
+          }
+      }
+
+  # Glavni install skript (namesto Ansible) #TEST PASSOWRDS
+  - path: /usr/local/bin/install-reportapp.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      TZ="Europe/Ljubljana"
+      DB_USER="admin"
+      DB_PASS="harvey7298" 
+      DB_NAME="reporting_db"
+      DB_HOST="localhost"
+      DB_PORT="5432"
+
+      APP_ROOT="/opt/reportapp"
+      # Če je repo privaten, zamenjaj URL s token-based varianto
+      REPO_URL="https://ghp_TOKEN@github.com/EgHz23/report-app.git"
+      BACKEND_DIR="${APP_ROOT}/backend/backend"
+      FRONTEND_DIR="${APP_ROOT}/frontend/frontend/report-app"
+
+      SSL_DIR="/etc/nginx/ssl"
+      SSL_CERT="${SSL_DIR}/cert.pem"
+      SSL_KEY="${SSL_DIR}/private.key"
+
+      echo "[*] Nastavljam timezone..."
+      timedatectl set-timezone "$TZ" || true
+
+      echo "[*] Omogočam PostgreSQL..."
+      systemctl enable --now postgresql || true
+
+      echo "[*] Ustvarjam system userja 'reportapp'..."
+      if ! id -u reportapp >/dev/null 2>&1; then
+        useradd -r -s /usr/sbin/nologin reportapp
+      fi
+
+      # Home dir za reportapp (Matplotlib, cache, itd.)
+      mkdir -p /home/reportapp
+      chown reportapp:reportapp /home/reportapp
+
+      # Dir za Matplotlib cache (MPLCONFIGDIR)
+      mkdir -p /var/lib/reportapp/matplotlib
+      chown -R reportapp:reportapp /var/lib/reportapp
+
+      echo "[*] PostgreSQL - ustvarjanje baze in uporabnika..."
+      # Uporabnik
+      sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 || \
+        sudo -u postgres psql -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';"
+
+      # Baza z ownerjem
+      sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
+        sudo -u postgres createdb -O "${DB_USER}" "${DB_NAME}"
+
+      # Za vsak slučaj nastavimo ownerja baze
+      sudo -u postgres psql -c "ALTER DATABASE ${DB_NAME} OWNER TO ${DB_USER};"
+
+      # Polni privilegiji na bazi
+      sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};"
+
+      # Pravice in owner na public schemi
+      sudo -u postgres psql -d "${DB_NAME}" -c "GRANT USAGE, CREATE ON SCHEMA public TO ${DB_USER};"
+      sudo -u postgres psql -d "${DB_NAME}" -c "ALTER SCHEMA public OWNER TO ${DB_USER};"
+      sudo -u postgres psql -d "${DB_NAME}" -c "GRANT ALL ON ALL TABLES IN SCHEMA public TO ${DB_USER};"
+      sudo -u postgres psql -d "${DB_NAME}" -c "GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};"
+
+      echo "[*] Omogočam Redis..."
+      systemctl enable --now redis-server
+
+      echo "[*] Priprava app root direktorija..."
+      mkdir -p "${APP_ROOT}"
+      chown -R reportapp:reportapp "${APP_ROOT}"
+
+      echo "[*] Kloniram ali posodabljam repo..."
+      if [ -d "${APP_ROOT}/.git" ]; then
+        cd "${APP_ROOT}"
+        git pull
+      else
+        rm -rf "${APP_ROOT:?}/"*
+        git clone "${REPO_URL}" "${APP_ROOT}"
+      fi
+      chown -R reportapp:reportapp "${APP_ROOT}"
+
+      echo "[*] Backend - venv in Python odvisnosti..."
+      cd "${BACKEND_DIR}"
+      python3 -m venv venv
+      source venv/bin/activate
+      pip install --upgrade pip
+      pip install -r "${BACKEND_DIR}/dependencies.txt"
+
+      echo "[*] Ustvarjam /etc/reportapp.env..."
+      cat >/etc/reportapp.env <<EOF
+      TZ=${TZ}
+      DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      REDIS_URL=redis://127.0.0.1:6379/0
+      SMTP_SERVER=127.0.0.1
+      SMTP_PORT=25
+      SENDER_EMAIL=eh76894@student.uni-lj.si
+      APP_ENV=development
+      BACKEND_PORT=8000
+      EOF
+      chown reportapp:reportapp /etc/reportapp.env
+      chmod 0640 /etc/reportapp.env
+
+      echo "[*] Ustvarjam /app direktorije za loge in reporte..."
+      mkdir -p /app/logs /app/generated_reports
+      chown -R reportapp:reportapp /app
+      touch /app/logs/audit.log
+      chown reportapp:reportapp /app/logs/audit.log
+      chmod 0644 /app/logs/audit.log
+
+      echo "[*] Namestitev Node.js 22 (NodeSource repo)..."
+      if [ ! -f /usr/share/keyrings/nodesource.gpg ]; then
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+        echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+        apt-get update -y
+      fi
+      apt-get install -y nodejs
+
+      echo "[*] Frontend - npm install + build (non-fatal)..."
+      if cd "${FRONTEND_DIR}"; then
+        npm install || echo "[!] npm install failed, continuing so backend still works"
+        npm run build -- --configuration=production || echo "[!] npm build failed, continuing so backend still works"
+      else
+        echo "[!] FRONTEND_DIR ${FRONTEND_DIR} ne obstaja, preskakujem frontend build"
+      fi
+
+      echo "[*] TLS - ustvarjam lokalni CA in server cert, če še ne obstajata..."
+      mkdir -p "${SSL_DIR}"
+      if [ ! -f "${SSL_DIR}/ca.key" ] || [ ! -f "${SSL_DIR}/ca.pem" ]; then
+        openssl genrsa -out "${SSL_DIR}/ca.key" 2048
+        openssl req -x509 -new -nodes -key "${SSL_DIR}/ca.key" -sha256 -days 3650 \
+          -subj "/CN=reportapp-local-CA" \
+          -out "${SSL_DIR}/ca.pem"
+      fi
+
+      if [ ! -f "${SSL_CERT}" ] || [ ! -f "${SSL_KEY}" ]; then
+        openssl genrsa -out "${SSL_KEY}" 2048
+        openssl req -new -key "${SSL_KEY}" \
+          -subj "/CN=localhost" \
+          -out "${SSL_DIR}/server.csr"
+        openssl x509 -req -in "${SSL_DIR}/server.csr" \
+          -CA "${SSL_DIR}/ca.pem" -CAkey "${SSL_DIR}/ca.key" -CAcreateserial \
+          -out "${SSL_CERT}" -days 365 -sha256
+      fi
+
+      echo "[*] Omogočam Nginx site..."
+      ln -sf /etc/nginx/sites-available/reportapp /etc/nginx/sites-enabled/reportapp
+      rm -f /etc/nginx/sites-enabled/default
+      nginx -t
+      systemctl enable --now nginx
+
+      echo "[*] Reload systemd in zaženem backend..."
+      systemctl daemon-reload
+      systemctl enable --now reportapp
+
+      echo "[*] Konfiguriram UFW (SSH, HTTP, HTTPS)..."
+      ufw default deny incoming
+      ufw allow 22/tcp
+      ufw allow 80/tcp
+      ufw allow 443/tcp
+      yes | ufw enable
+
+      echo "[*] Končano - Report App je nameščen."
+
+# 2) runcmd se v cloud-init pipeline zažene po packages in write_files
+runcmd:
+  - [ bash, -c, "chmod +x /usr/local/bin/install-reportapp.sh && /usr/local/bin/install-reportapp.sh" ]

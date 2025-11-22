@@ -1,0 +1,373 @@
+- hosts: reportvm
+  become: true
+
+  vars:
+    # Kje bo app na VM
+    github_token: "ghp_TOKEN...."
+    repo_url: "https://{{ github_token }}@github.com/EgHz23/report-app.git"
+    app_root: /opt/reportapp
+
+    # Relative poti v repozitoriju
+    backend_dir_rel: "backend/backend"
+    frontend_dir_rel: "frontend/frontend/report-app"
+
+    # Uvicorn modul (main.py, app = FastAPI())
+    uvicorn_module: "main:app"
+
+    # DB in ostali ENV
+    db_user: "admin"
+    db_pass: "harvey7298" # TEST PASSWORDS
+    db_name: "reporting_db"
+    db_host: "localhost"
+    db_port: "5432"
+    tz: "Europe/Ljubljana"
+
+    # Node.js verzija (Angular)
+    node_major: "22"
+
+    # TLS (lokalni CA + server cert)
+    ssl_dir: /etc/nginx/ssl
+    ssl_cert: /etc/nginx/ssl/cert.pem
+    ssl_key: /etc/nginx/ssl/private.key
+
+  tasks:
+    # ------------------------------------------------------------------------
+    # OS osnovna nastavitev
+    # ------------------------------------------------------------------------
+    - name: Nastavi timezone
+      timezone:
+        name: "{{ tz }}"
+
+    - name: Namesti OS pakete (Nginx, PostgreSQL, Redis, build in WeasyPrint odvisnosti)
+      apt:
+        name:
+          - nginx
+          - postgresql
+          - postgresql-contrib
+          - redis-server
+          - build-essential
+          - python3-dev
+          - libpq-dev
+          - curl
+          - gnupg
+          # WeasyPrint / Pango / Cairo dependencies
+          - libpango-1.0-0
+          - libpangoft2-1.0-0
+          - libcairo2
+          - libffi-dev
+        state: present
+        update_cache: yes
+
+    # ------------------------------------------------------------------------
+    # Uporabnik in pravice za aplikacijo (1b)
+    # ------------------------------------------------------------------------
+    - name: Ustvari system userja za Report App (brez login shella)
+      user:
+        name: reportapp
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    # ------------------------------------------------------------------------
+    # PostgreSQL: DB + uporabnik + pravice
+    # ------------------------------------------------------------------------
+    - name: Ustvari DB, če ne obstaja
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 \
+          || sudo -u postgres createdb "{{ db_name }}"
+      args:
+        executable: /bin/bash
+
+    - name: Ustvari uporabnika, če ne obstaja
+      shell: |
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_user }}'" | grep -q 1 \
+          || sudo -u postgres psql -c "CREATE USER {{ db_user }};"
+      args:
+        executable: /bin/bash
+
+    - name: Nastavi geslo in pravice za uporabnika
+      shell: |
+        sudo -u postgres psql -c "ALTER USER {{ db_user }} WITH PASSWORD '{{ db_pass }}';"
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_user }};"
+      args:
+        executable: /bin/bash
+
+    - name: Omogoči in zaženi Redis
+      service:
+        name: redis-server
+        state: started
+        enabled: true
+
+    # ------------------------------------------------------------------------
+    # Priprava app direktorija in klon repozitorija
+    # ------------------------------------------------------------------------
+    - name: Ustvari app root (/opt/reportapp) in nastavi lastnika reportapp
+      file:
+        path: "{{ app_root }}"
+        state: directory
+        mode: "0755"
+        owner: reportapp
+        group: reportapp
+
+    - name: Označi /opt/reportapp kot varno mapo za Git
+      command: git config --global --add safe.directory {{ app_root }}
+
+    - name: Kloniraj ali posodobi repo (Infra as Code)
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_root }}"
+        version: HEAD
+        force: yes
+    # ------------------------------------------------------------------------
+    # Python backend (virtualenv + dependencies)
+    # ------------------------------------------------------------------------
+    - name: Ustvari Python venv za backend
+      command: python3 -m venv venv
+      args:
+        chdir: "{{ app_root }}/{{ backend_dir_rel }}"
+        creates: "{{ app_root }}/{{ backend_dir_rel }}/venv/bin/activate"
+
+    - name: Namesti Python odvisnosti iz dependencies.txt
+      shell: |
+        . venv/bin/activate
+        pip install --upgrade pip
+        pip install -r "{{ app_root }}/{{ backend_dir_rel }}/dependencies.txt"
+      args:
+        chdir: "{{ app_root }}/{{ backend_dir_rel }}"
+        executable: /bin/bash
+
+    - name: Ustvari ENV datoteko za backend (systemd jo prebere)
+      copy:
+        dest: /etc/reportapp.env
+        mode: "0640"
+        content: |
+          TZ={{ tz }}
+          DATABASE_URL=postgresql://{{ db_user }}:{{ db_pass }}@{{ db_host }}:{{ db_port }}/{{ db_name }}
+          REDIS_URL=redis://127.0.0.1:6379/0
+          SMTP_SERVER=127.0.0.1
+          SMTP_PORT=25
+          SENDER_EMAIL=eh76894@student.uni-lj.si
+          APP_ENV=development
+          BACKEND_PORT=8000
+
+    - name: Ustvari /app direktorije za loge in reporte 
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: reportapp
+        group: reportapp
+        mode: "0755"
+        recurse: yes
+      loop:
+        - /app
+        - /app/logs
+        - /app/generated_reports
+
+    - name: Prepričaj se, da audit log datoteka obstaja in je v lasti reportapp
+      file:
+        path: /app/logs/audit.log
+        state: touch
+        owner: reportapp
+        group: reportapp
+        mode: "0644"
+
+    - name: Systemd servis za backend (teče kot reportapp user)
+      copy:
+        dest: /etc/systemd/system/reportapp.service
+        content: |
+          [Unit]
+          Description=Report App Backend (FastAPI)
+          After=network.target postgresql.service redis-server.service
+
+          [Service]
+          User=reportapp
+          WorkingDirectory={{ app_root }}/{{ backend_dir_rel }}
+          EnvironmentFile=/etc/reportapp.env
+          ExecStart={{ app_root }}/{{ backend_dir_rel }}/venv/bin/uvicorn {{ uvicorn_module }} --host 0.0.0.0 --port 8000
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+      notify:
+        - daemon-reload
+        - restart-backend
+
+    # ------------------------------------------------------------------------
+    # Node.js + build Angular frontenda
+    # ------------------------------------------------------------------------
+    - name: Dodaj NodeSource key za Node {{ node_major }}
+      shell: |
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+      args:
+        creates: /usr/share/keyrings/nodesource.gpg
+
+    - name: Dodaj NodeSource repo
+      copy:
+        dest: /etc/apt/sources.list.d/nodesource.list
+        content: |
+          deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_{{ node_major }}.x nodistro main
+
+    - name: Namesti Node.js {{ node_major }}
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+
+    - name: Namesti frontend odvisnosti (npm install)
+      shell: |
+        npm install
+      args:
+        chdir: "{{ app_root }}/{{ frontend_dir_rel }}"
+        executable: /bin/bash
+
+    - name: Zgradi frontend (production)
+      shell: |
+        npm run build -- --configuration=production
+      args:
+        chdir: "{{ app_root }}/{{ frontend_dir_rel }}"
+        executable: /bin/bash
+
+    # ------------------------------------------------------------------------
+    # TLS: lokalni CA + server cert (1a – “praviši” HTTPS)
+    # ------------------------------------------------------------------------
+    - name: Ustvari TLS direktorij
+      file:
+        path: "{{ ssl_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ustvari lokalni CA ključ in cert, če še ne obstaja
+      shell: |
+        [ -f "{{ ssl_dir }}/ca.key" ] && [ -f "{{ ssl_dir }}/ca.pem" ] && exit 0
+        openssl genrsa -out "{{ ssl_dir }}/ca.key" 2048
+        openssl req -x509 -new -nodes -key "{{ ssl_dir }}/ca.key" -sha256 -days 3650 \
+          -subj "/CN=reportapp-local-CA" \
+          -out "{{ ssl_dir }}/ca.pem"
+      args:
+        executable: /bin/bash
+
+    - name: Ustvari strežniški ključ in cert podpisan z lokalnim CA, če še ne obstaja
+      shell: |
+        [ -f "{{ ssl_cert }}" ] && [ -f "{{ ssl_key }}" ] && exit 0
+        openssl genrsa -out "{{ ssl_key }}" 2048
+        openssl req -new -key "{{ ssl_key }}" \
+          -subj "/CN=localhost" \
+          -out "{{ ssl_dir }}/server.csr"
+        openssl x509 -req -in "{{ ssl_dir }}/server.csr" \
+          -CA "{{ ssl_dir }}/ca.pem" -CAkey "{{ ssl_dir }}/ca.key" -CAcreateserial \
+          -out "{{ ssl_cert }}" -days 365 -sha256
+      args:
+        executable: /bin/bash
+
+    # ------------------------------------------------------------------------
+    # Nginx kot reverse proxy + statični Angular frontend
+    # ------------------------------------------------------------------------
+    - name: Nginx site conf (HTTPS + reverse proxy + Angular)
+      copy:
+        dest: /etc/nginx/sites-available/reportapp
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              # HTTP -> HTTPS redirect (opcijsko)
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name _;
+
+              ssl_certificate     {{ ssl_cert }};
+              ssl_certificate_key {{ ssl_key }};
+
+              client_max_body_size 50m;
+
+              # API -> backend (FastAPI)
+              location /api/ {
+                  proxy_pass http://127.0.0.1:8000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              # FRONTEND (Angular build)
+              location / {
+                  root {{ app_root }}/{{ frontend_dir_rel }}/dist/report-app/browser;
+                  index index.html;
+                  try_files $uri $uri/ /index.html;
+              }
+          }
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/reportapp
+        dest: /etc/nginx/sites-enabled/reportapp
+        state: link
+        force: true
+      notify: [reload-nginx]
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: [reload-nginx]
+
+    # ------------------------------------------------------------------------
+    # Firewall (UFW) – dovoli samo SSH + HTTP + HTTPS (1c)
+    # ------------------------------------------------------------------------
+    - name: Namesti UFW (požarni zid)
+      apt:
+        name: ufw
+        state: present
+        update_cache: yes
+
+    - name: Dovoli SSH, HTTP in HTTPS skozi UFW
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "22"
+        - "80"
+        - "443"
+        - "3389"
+
+    - name: Vklopi UFW z default deny politiko
+      ufw:
+        state: enabled
+        policy: deny
+
+    # ------------------------------------------------------------------------
+    # GUI v VM (4. točka) – XFCE + xrdp (RDP dostop)
+    # ------------------------------------------------------------------------
+    - name: Namesti osnovni GUI (XFCE) in xrdp za RDP dostop
+      apt:
+        name:
+          - xrdp
+          - xfce4
+        state: present
+        update_cache: yes
+
+    - name: Omogoči in zaženi xrdp servis
+      systemd:
+        name: xrdp
+        state: started
+        enabled: true
+
+  handlers:
+    - name: daemon-reload
+      command: systemctl daemon-reload
+
+    - name: restart-backend
+      service:
+        name: reportapp
+        state: restarted
+        enabled: true
+
+    - name: reload-nginx
+      service:
+        name: nginx
+        state: restarted
+        enabled: true
