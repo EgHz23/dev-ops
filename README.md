@@ -160,4 +160,128 @@ localhost:33389
 
 "Vsa gesla v projektu so samo testna"
 
+--------------------------------------------------------------------------
 
+– Postavitev Aplikcaije ReportApp z uporabo Cloud-Init in Multipass
+
+Opis
+
+Ta del projekta predstavlja popolnoma avtomatiziran način namestitve Report App z uporabo cloud-init.
+
+Cloud-init skripta:
+
+namesti vse sistemske pakete (Nginx, PostgreSQL, Redis, Node.js, Python …),
+ustvari TLS certifikate,
+pripravi mape za backend in frontend aplikacijo,
+klonira in namesti Report App,
+vzpostavi systemd servis za FastAPI backend,
+konfigurira Nginx kot reverse proxy,
+omogoči UFW požarni zid,
+nastavi XFCE grafično okolje (če je zaželeno),
+zažene aplikacijo in zagotovi, da se ob vsakem zagonu samodejno zažene tudi backend.
+
+Struktura: 
+
+cloud-init/
+└── cloud-init.yml
+
+### 1. cloud-init.yml
+
+Glavna konfiguracijska datoteka, ki jo Multipass uporabi:
+
+### 1.1 Namestitev paketov
+
+Cloud-init najprej izvede:
+packages:
+  - nginx
+  - postgresql
+  - postgresql-contrib
+  - redis-server
+  - git
+  - python3
+  - python3-pip
+  - python3-venv
+  - build-essential
+  - python3-dev
+  - libpq-dev
+  - curl
+  - gnupg
+  - libpango-1.0-0
+  - libpangoft2-1.0-0
+  - libcairo2
+  - libffi-dev
+  - ufw
+  - xfce4
+  ...
+Namestijo se ključni strežniški paketi
+
+### 1.2 write_files
+
+Vnaprej se ustvarijo ključne sistemske datoteke:
+
+- reportapp.service (systemd servis)
+Skrbi, da se FastAPI backend izvaja kot sistemska storitev:
+teče kot uporabnik reportapp
+uporablja virtualno okolje
+samodejno restarta ob napaki
+
+Nginx konfiguracija:
+
+Datoteka /etc/nginx/sites-available/reportapp nastavi:
+reverse proxy za /api/ → FastAPI backend
+statično serviranje Angular frontenda
+povečanje client_max_body_size
+privzeto poslušanje na 80/tcp
+
+Namestitveni skript install-reportapp.sh
+
+To je osrednji del avtomatizacije.
+Skripta vključuje:
+ustvarjanje sistemskega uporabnika reportapp
+namestitev PostgreSQL baze in uporabnika
+kloniranje GitHub repozitorija
+pripravljen Python virtualenv
+namestitev Node.js (NodeSource)
+build Angular frontenda
+generiranje CA in TLS strežniškega certifikata
+nastavitev okoljske datoteke /etc/reportapp.env
+pripravo /app direktorijev za loge in poročila
+konfiguracijo UFW
+Cloud-init skrbi, da se skripta izvrši ob prvem zagonu.
+
+### 1.3 runcmd
+
+Na koncu se izvede:
+runcmd:
+  - [ bash, -c, "chmod +x /usr/local/bin/install-reportapp.sh && /usr/local/bin/install-reportapp.sh" ]
+
+### 2. Uporaba z Multipass
+
+Multipass omogoča enostavno ustvarjanje Ubuntu VM-jev s cloud-init skriptami.
+
+Ustvarjanje virtualnega stroja:
+multipass launch `
+>>   --name reportapp `
+>>   --disk 30G `
+>>   --memory 8G `
+>>   --cpus 4 `
+>>   --cloud-init "C:\Users\egzon\dev-ops\cloud-init\cloud-init.yml" `
+>>   --timeout 1800 `
+>>   --network Wi-Fi
+
+### 2.1 Dostop do VM-ja
+
+SSH:
+multipass shell reportapp
+
+Pridobivanje IP naslova:
+multipass info reportapp
+
+### 3. Dostop do aplikacije
+
+Ko cloud-init zaključi, je aplikacija dostopna na:
+- HTTP:
+http://<VM-IP>/
+- API (FastAPI backend):
+http://<VM-IP>/api/
+- Nginx reverse proxy je prednastavljen za razvojne potrebe.
