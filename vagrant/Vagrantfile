@@ -28,7 +28,7 @@ Vagrant.configure("2") do |config|
 
   # 2. Zaženi Ansible playbook
   config.vm.provision "ansible_local" do |ansible|
-    ansible.playbook = "/vagrant/ansible/playbook.yml"
+    ansible.playbook = "/vagrant/ansible/playbook-docker.yml"
     ansible.inventory_path = "/vagrant/ansible/inventory"
     ansible.limit = "all"
   end

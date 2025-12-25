@@ -1,0 +1,224 @@
+﻿- hosts: reportvm
+  become: true
+
+  vars:
+    # Kje bo app repo na VM
+    github_token: "ghp_TOKEN...."
+    repo_url: "https://{{ github_token }}@github.com/EgHz23/report-app.git"
+    app_root: /opt/reportapp
+
+    # Kje v repozitoriju je docker-compose projekt (TU pricakujemo docker-compose.yml)
+    compose_project_dir: "{{ app_root }}/infra"
+
+    # Timezone
+    tz: "Europe/Ljubljana"
+
+    # TLS (za nginx container - volume z self-signed certom)
+    ssl_dir: "{{ compose_project_dir }}/nginx/ssl"
+    ssl_cert: "{{ ssl_dir }}/cert.pem"
+    ssl_key: "{{ ssl_dir }}/private.key"
+
+    # Volume direktoriji (morajo obstajati, ce jih uporablja docker-compose.yml)
+    audit_logs_dir: "{{ compose_project_dir }}/audit-logs"
+    generated_reports_dir: "{{ compose_project_dir }}/generated-reports"
+    pgdata_dir: "{{ compose_project_dir }}/backup/pgdata"
+    nginx_conf_dir: "{{ compose_project_dir }}/nginx/conf.d"
+
+  tasks:
+    # ----------------------------------------------------------------------
+    # OS osnovna nastavitev
+    # ----------------------------------------------------------------------
+    - name: Nastavi timezone
+      timezone:
+        name: "{{ tz }}"
+
+    - name: Namesti osnovne pakete (git, ca-certificates, curl, gnupg)
+      apt:
+        name:
+          - git
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    # ----------------------------------------------------------------------
+    # Namestitev Docker + Docker Compose plugin
+    # ----------------------------------------------------------------------
+    - name: Dodaj Docker GPG key
+      ansible.builtin.shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        executable: /bin/bash
+      register: docker_gpg
+      changed_when: docker_gpg.rc == 0
+
+    - name: Dodaj Docker repo
+      copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        content: |
+          deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") $(lsb_release -cs) stable
+
+    - name: Namesti Docker engine in compose plugin
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Poskrbi, da docker tece in je enable-an
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    # ----------------------------------------------------------------------
+    # Priprava app direktorija in klon repozitorija (Infra as Code)
+    # ----------------------------------------------------------------------
+    - name: Ustvari app root {{ app_root }}
+      file:
+        path: "{{ app_root }}"
+        state: directory
+        mode: "0755"
+
+    - name: Oznaci {{ app_root }} kot varno mapo za Git
+      command: git config --global --add safe.directory {{ app_root }}
+
+    - name: Kloniraj ali posodobi repo (Infra as Code)
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_root }}"
+        version: HEAD
+        force: yes
+
+    # ----------------------------------------------------------------------
+    # Priprava volume direktorijev, ki jih uporablja docker-compose.yml
+    # ----------------------------------------------------------------------
+    - name: Ustvari volume direktorije (logs, reports, pgdata, nginx conf/ssl)
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ audit_logs_dir }}"
+        - "{{ generated_reports_dir }}"
+        - "{{ pgdata_dir }}"
+        - "{{ nginx_conf_dir }}"
+        - "{{ ssl_dir }}"
+
+    # ----------------------------------------------------------------------
+    # Nginx config files for reverse proxy and timeouts
+    # ----------------------------------------------------------------------
+    - name: Ustvari nginx default.conf
+      copy:
+        dest: "{{ nginx_conf_dir }}/default.conf"
+        content: |
+          server {
+              listen 443 ssl;
+
+              ssl_certificate /etc/ssl/cert.pem;
+              ssl_certificate_key /etc/ssl/private.key;
+
+              # Allow bigger uploads (tune as you like)
+              client_max_body_size 50m;
+
+              # === NEW: Document summarizer reverse proxy ===
+              # Example path: https://your-host/docsum/summarize
+              location /docsum/ {
+                  # NOTE the trailing slash here ensures /docsum/summarize -> /summarize upstream
+                  proxy_pass http://doc-summarizer:8080/;
+
+                  proxy_http_version 1.1;
+                  proxy_request_buffering off;   # stream uploads to upstream (good for large files)
+                  proxy_read_timeout 180s;       # allow longer Azure calls
+                  proxy_send_timeout 180s;
+
+                  proxy_set_header Host              $host;
+                  proxy_set_header X-Real-IP         $remote_addr;
+                  proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              # Existing backend
+              location /api/ {
+                  proxy_pass http://reporting-backend:8000/;
+
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  proxy_set_header Authorization $http_authorization;
+                  add_header X-Debug-Authorization "$http_authorization" always;
+              }
+
+              # Existing frontend
+              location / {
+                  proxy_pass http://reporting-frontend/;
+                  proxy_intercept_errors on;
+                  error_page 404 = /index.html;
+
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              error_page 500 502 503 504 /50x.html;
+              location = /50x.html { root /usr/share/nginx/html; }
+          }
+
+    - name: Ustvari nginx timeout.conf
+      copy:
+        dest: "{{ nginx_conf_dir }}/timeout.conf"
+        content: |
+          proxy_connect_timeout       600;
+          proxy_send_timeout          600;
+          proxy_read_timeout          600;
+          send_timeout                600;
+
+    # ----------------------------------------------------------------------
+    # TLS: self-signed cert za nginx (mount v containerju)
+    # ----------------------------------------------------------------------
+    - name: Ustvari self-signed TLS cert, ce se ne obstaja
+      shell: |
+        if [ -f "{{ ssl_cert }}" ] && [ -f "{{ ssl_key }}" ]; then
+          exit 0
+        fi
+        openssl req -x509 -nodes -newkey rsa:2048 \
+          -keyout "{{ ssl_key }}" \
+          -out "{{ ssl_cert }}" \
+          -days 365 \
+          -subj "/CN=report-app.local"
+      args:
+        executable: /bin/bash
+
+    # ----------------------------------------------------------------------
+    # Docker Compose: pull & up celotnega stacka
+    # ----------------------------------------------------------------------
+    - name: Preveri, da docker-compose.yml obstaja
+      stat:
+        path: "{{ compose_project_dir }}/docker-compose.yml"
+      register: compose_file
+
+    - name: Fail, ce docker-compose.yml ne obstaja
+      fail:
+        msg: "Datoteka {{ compose_project_dir }}/docker-compose.yml ne obstaja. Poskrbi, da je v repozitoriju."
+      when: not compose_file.stat.exists
+
+    - name: docker compose pull (potegni zadnje image iz registry - CI/CD del)
+      ansible.builtin.command: docker compose pull
+      args:
+        chdir: "{{ compose_project_dir }}"
+
+    - name: zazeni cel stack (nginx, frontend, backend, scheduler, postgres)
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ compose_project_dir }}"
