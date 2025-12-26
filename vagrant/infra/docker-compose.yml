@@ -1,153 +1,100 @@
-- hosts: reportvm
-  become: true
+version: "3.9"
 
-  vars:
-    # Kje bo app repo na VM
-    github_token: "ghp_TOKEN...."
-    repo_url: "https://{{ github_token }}@github.com/EgHz23/report-app.git"
-    app_root: /opt/reportapp
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-avichron
+    environment:
+      POSTGRES_USER: Admin
+      POSTGRES_PASSWORD: harvey7298   # TEST ONLY
+      POSTGRES_DB: reporting_db
+      TZ: Europe/Ljubljana
+    volumes:
+      - ./backup/pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U Admin -d reporting_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      avichron-net:
+        aliases:
+          - postgres
 
-    # Kje v repozitoriju je docker-compose projekt (TU pričakujemo docker-compose.yml)
-    compose_project_dir: "{{ app_root }}/infra"
+  backend:
+    image: ghcr.io/<OWNER>/reporting-backend:latest
+    container_name: reporting-backend
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Ljubljana
+      RUN_SCHEDULER: "0"
+      DATABASE_URL: postgresql://Admin:harvey7298@postgres:5432/reporting_db
+      WEB_CONCURRENCY: "3"
+      WEB_THREADS: "2"
+      GUNICORN_TIMEOUT: "900"
+      ZABBIX_SUPPRESS_TLS_WARNINGS: "1"
+    volumes:
+      - ./audit-logs:/app/logs
+      - ./generated-reports:/app/generated_reports
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    networks:
+      - avichron-net
 
-    # Timezone
-    tz: "Europe/Ljubljana"
+  scheduler:
+    image: ghcr.io/<OWNER>/reporting-backend:latest
+    container_name: reporting-scheduler
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Ljubljana
+      RUN_SCHEDULER: "1"
+      SCHEDULER_MAX_CONCURRENCY: "3"
+      DATABASE_URL: postgresql://Admin:harvey7298@postgres:5432/reporting_db
+    command: >
+      bash -lc "python -c \"import asyncio; from services.scheduler import scheduler;
+      asyncio.run(scheduler.run_scheduler())\""
+    volumes:
+      - ./audit-logs:/app/logs
+      - ./generated-reports:/app/generated_reports
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    networks:
+      - avichron-net
 
-    # TLS (za nginx container – volume z self-signed certom)
-    ssl_dir: "{{ compose_project_dir }}/nginx/ssl"
-    ssl_cert: "{{ ssl_dir }}/fullchain.pem"
-    ssl_key: "{{ ssl_dir }}/privkey.pem"
+  frontend:
+    image: ghcr.io/<OWNER>/reporting-frontend:latest
+    container_name: reporting-frontend
+    environment:
+      TZ: Europe/Ljubljana
+      # frontend talks to backend via nginx (/api), not directly
+    restart: unless-stopped
+    networks:
+      - avichron-net
 
-    # Volume direktoriji (morajo obstajati, če jih uporabljaš v docker-compose.yml)
-    audit_logs_dir: "{{ compose_project_dir }}/audit-logs"
-    generated_reports_dir: "{{ compose_project_dir }}/generated-reports"
-    pgdata_dir: "{{ compose_project_dir }}/backup/pgdata"
-    nginx_conf_dir: "{{ compose_project_dir }}/nginx/conf.d"
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-avichron
+    environment:
+      TZ: Europe/Ljubljana
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:Z
+      - ./nginx/ssl:/etc/ssl
+    depends_on:
+      - backend
+      - frontend
+      # - doc-summarizer
+    restart: unless-stopped
+    networks:
+      - avichron-net
 
-  tasks:
-    # ----------------------------------------------------------------------
-    # OS osnovna nastavitev
-    # ----------------------------------------------------------------------
-    - name: Nastavi timezone
-      timezone:
-        name: "{{ tz }}"
-
-    - name: Namesti osnovne pakete (git, ca-certificates, curl, gnupg)
-      apt:
-        name:
-          - git
-          - ca-certificates
-          - curl
-          - gnupg
-          - lsb-release
-        state: present
-        update_cache: yes
-
-    # ----------------------------------------------------------------------
-    # Namestitev Docker + Docker Compose plugin
-    # ----------------------------------------------------------------------
-    - name: Dodaj Docker GPG key
-      ansible.builtin.shell: |
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        chmod a+r /etc/apt/keyrings/docker.gpg
-      args:
-        executable: /bin/bash
-      register: docker_gpg
-      changed_when: docker_gpg.rc == 0
-
-    - name: Dodaj Docker repo
-      copy:
-        dest: /etc/apt/sources.list.d/docker.list
-        content: |
-          deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") $(lsb_release -cs) stable
-
-    - name: Namesti Docker engine in compose plugin
-      apt:
-        name:
-          - docker-ce
-          - docker-ce-cli
-          - containerd.io
-          - docker-buildx-plugin
-          - docker-compose-plugin
-        state: present
-        update_cache: yes
-
-    - name: Poskrbi, da docker teče in je enable-an
-      service:
-        name: docker
-        state: started
-        enabled: true
-
-    # ----------------------------------------------------------------------
-    # Priprava app direktorija in klon repozitorija (Infra as Code)
-    # ----------------------------------------------------------------------
-    - name: Ustvari app root {{ app_root }}
-      file:
-        path: "{{ app_root }}"
-        state: directory
-        mode: "0755"
-
-    - name: Označi {{ app_root }} kot varno mapo za Git
-      command: git config --global --add safe.directory {{ app_root }}
-
-    - name: Kloniraj ali posodobi repo (Infra as Code)
-      git:
-        repo: "{{ repo_url }}"
-        dest: "{{ app_root }}"
-        version: HEAD
-        force: yes
-
-    # ----------------------------------------------------------------------
-    # Priprava volume direktorijev, ki jih uporablja docker-compose.yml
-    # ----------------------------------------------------------------------
-    - name: Ustvari volume direktorije (logs, reports, pgdata, nginx conf/ssl)
-      file:
-        path: "{{ item }}"
-        state: directory
-        mode: "0755"
-      loop:
-        - "{{ audit_logs_dir }}"
-        - "{{ generated_reports_dir }}"
-        - "{{ pgdata_dir }}"
-        - "{{ nginx_conf_dir }}"
-        - "{{ ssl_dir }}"
-
-    # ----------------------------------------------------------------------
-    # TLS: self-signed cert za nginx (mount v containerju)
-    # ----------------------------------------------------------------------
-    - name: Ustvari self-signed TLS cert, če še ne obstaja
-      shell: |
-        if [ -f "{{ ssl_cert }}" ] && [ -f "{{ ssl_key }}" ]; then
-          exit 0
-        fi
-        openssl req -x509 -nodes -newkey rsa:2048 \
-          -keyout "{{ ssl_key }}" \
-          -out "{{ ssl_cert }}" \
-          -days 365 \
-          -subj "/CN=report-app.local"
-      args:
-        executable: /bin/bash
-
-    # ----------------------------------------------------------------------
-    # Docker Compose: pull & up celotnega stacka
-    # ----------------------------------------------------------------------
-    - name: Preveri, da docker-compose.yml obstaja
-      stat:
-        path: "{{ compose_project_dir }}/docker-compose.yml"
-      register: compose_file
-
-    - name: Fail, če docker-compose.yml ne obstaja
-      fail:
-        msg: "Datoteka {{ compose_project_dir }}/docker-compose.yml ne obstaja. Poskrbi, da je v repozitoriju."
-      when: not compose_file.stat.exists
-
-    - name: docker compose pull (potegni zadnje image iz registry CI/CD del)
-      ansible.builtin.command: docker compose pull
-      args:
-        chdir: "{{ compose_project_dir }}"
-
-    - name: zazeni cel stack (nginx, frontend, backend, scheduler, postgres)
-      ansible.builtin.command: docker compose up -d
-      args:
-        chdir: "{{ compose_project_dir }}"
+networks:
+  avichron-net:
+    driver: bridge
