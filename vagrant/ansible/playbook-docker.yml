@@ -2,27 +2,22 @@
   become: true
 
   vars:
-    # Kje bo app repo na VM
-    github_token: "ghp_TOKEN...."
-    repo_url: "https://{{ github_token }}@github.com/EgHz23/report-app.git"
-    app_root: /opt/reportapp
-
-    # Kje v repozitoriju je docker-compose projekt (TU pricakujemo docker-compose.yml)
-    compose_project_dir: "{{ app_root }}/infra"
+    # Kje je docker-compose projekt na VM (Vagrant synced folder)
+    compose_project_dir: "/vagrant/infra"
 
     # Timezone
     tz: "Europe/Ljubljana"
 
-    # TLS (za nginx container - volume z self-signed certom)
-    ssl_dir: "{{ compose_project_dir }}/nginx/ssl"
+    # TLS (za nginx container – volume z self-signed certom)
+    ssl_dir: "{{ compose_project_dir }}/ssl"
     ssl_cert: "{{ ssl_dir }}/cert.pem"
     ssl_key: "{{ ssl_dir }}/private.key"
 
-    # Volume direktoriji (morajo obstajati, ce jih uporablja docker-compose.yml)
+    # Volume direktoriji (morajo obstajati, če jih uporablja docker-compose.yml)
     audit_logs_dir: "{{ compose_project_dir }}/audit-logs"
     generated_reports_dir: "{{ compose_project_dir }}/generated-reports"
     pgdata_dir: "{{ compose_project_dir }}/backup/pgdata"
-    nginx_conf_dir: "{{ compose_project_dir }}/nginx/conf.d"
+    nginx_conf_dir: "{{ compose_project_dir }}/conf.d"
 
   tasks:
     # ----------------------------------------------------------------------
@@ -73,30 +68,11 @@
         state: present
         update_cache: yes
 
-    - name: Poskrbi, da docker tece in je enable-an
+    - name: Poskrbi, da docker teče in je enable-an
       service:
         name: docker
         state: started
         enabled: true
-
-    # ----------------------------------------------------------------------
-    # Priprava app direktorija in klon repozitorija (Infra as Code)
-    # ----------------------------------------------------------------------
-    - name: Ustvari app root {{ app_root }}
-      file:
-        path: "{{ app_root }}"
-        state: directory
-        mode: "0755"
-
-    - name: Oznaci {{ app_root }} kot varno mapo za Git
-      command: git config --global --add safe.directory {{ app_root }}
-
-    - name: Kloniraj ali posodobi repo (Infra as Code)
-      git:
-        repo: "{{ repo_url }}"
-        dest: "{{ app_root }}"
-        version: HEAD
-        force: yes
 
     # ----------------------------------------------------------------------
     # Priprava volume direktorijev, ki jih uporablja docker-compose.yml
@@ -114,80 +90,26 @@
         - "{{ ssl_dir }}"
 
     # ----------------------------------------------------------------------
-    # Nginx config files for reverse proxy and timeouts
+    # Preveri, da nginx conf datoteke obstajajo v infra/conf.d
     # ----------------------------------------------------------------------
-    - name: Ustvari nginx default.conf
-      copy:
-        dest: "{{ nginx_conf_dir }}/default.conf"
-        content: |
-          server {
-              listen 443 ssl;
+    - name: Preveri, da nginx conf datoteke obstajajo
+      stat:
+        path: "{{ nginx_conf_dir }}/{{ item }}"
+      loop:
+        - default.conf
+        # če timeout.conf ne obstaja, odstrani to linijo ali ga dodaj v repo
+        # - timeout.conf
+      register: nginx_conf_files
 
-              ssl_certificate /etc/ssl/cert.pem;
-              ssl_certificate_key /etc/ssl/private.key;
-
-              # Allow bigger uploads (tune as you like)
-              client_max_body_size 50m;
-
-              # === NEW: Document summarizer reverse proxy ===
-              # Example path: https://your-host/docsum/summarize
-              location /docsum/ {
-                  # NOTE the trailing slash here ensures /docsum/summarize -> /summarize upstream
-                  proxy_pass http://doc-summarizer:8080/;
-
-                  proxy_http_version 1.1;
-                  proxy_request_buffering off;   # stream uploads to upstream (good for large files)
-                  proxy_read_timeout 180s;       # allow longer Azure calls
-                  proxy_send_timeout 180s;
-
-                  proxy_set_header Host              $host;
-                  proxy_set_header X-Real-IP         $remote_addr;
-                  proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-
-              # Existing backend
-              location /api/ {
-                  proxy_pass http://reporting-backend:8000/;
-
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-
-                  proxy_set_header Authorization $http_authorization;
-                  add_header X-Debug-Authorization "$http_authorization" always;
-              }
-
-              # Existing frontend
-              location / {
-                  proxy_pass http://reporting-frontend/;
-                  proxy_intercept_errors on;
-                  error_page 404 = /index.html;
-
-                  proxy_set_header Host $host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-
-              error_page 500 502 503 504 /50x.html;
-              location = /50x.html { root /usr/share/nginx/html; }
-          }
-
-    - name: Ustvari nginx timeout.conf
-      copy:
-        dest: "{{ nginx_conf_dir }}/timeout.conf"
-        content: |
-          proxy_connect_timeout       600;
-          proxy_send_timeout          600;
-          proxy_read_timeout          600;
-          send_timeout                600;
+    - name: Fail, če nginx conf datoteke manjkajo
+      fail:
+        msg: "Manjkajo nginx conf datoteke v {{ nginx_conf_dir }} (default.conf, timeout.conf?)."
+      when: nginx_conf_files.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
 
     # ----------------------------------------------------------------------
     # TLS: self-signed cert za nginx (mount v containerju)
     # ----------------------------------------------------------------------
-    - name: Ustvari self-signed TLS cert, ce se ne obstaja
+    - name: Ustvari self-signed TLS cert, če še ne obstaja
       shell: |
         if [ -f "{{ ssl_cert }}" ] && [ -f "{{ ssl_key }}" ]; then
           exit 0
@@ -208,9 +130,9 @@
         path: "{{ compose_project_dir }}/docker-compose.yml"
       register: compose_file
 
-    - name: Fail, ce docker-compose.yml ne obstaja
+    - name: Fail, če docker-compose.yml ne obstaja
       fail:
-        msg: "Datoteka {{ compose_project_dir }}/docker-compose.yml ne obstaja. Poskrbi, da je v repozitoriju."
+        msg: "Datoteka {{ compose_project_dir }}/docker-compose.yml ne obstaja. Poskrbi, da je v infra/."
       when: not compose_file.stat.exists
 
     - name: docker compose pull (potegni zadnje image iz registry - CI/CD del)
@@ -218,7 +140,7 @@
       args:
         chdir: "{{ compose_project_dir }}"
 
-    - name: zazeni cel stack (nginx, frontend, backend, scheduler, postgres)
+    - name: Zaženi cel stack (nginx, frontend, backend, scheduler, postgres)
       ansible.builtin.command: docker compose up -d
       args:
         chdir: "{{ compose_project_dir }}"

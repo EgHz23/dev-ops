@@ -23,7 +23,7 @@ services:
           - postgres
 
   backend:
-    image: ghcr.io/<OWNER>/reporting-backend:latest
+    image: ghcr.io/EgHz23/reporting-backend:latest
     container_name: reporting-backend
     env_file:
       - .env
@@ -45,7 +45,7 @@ services:
       - avichron-net
 
   scheduler:
-    image: ghcr.io/<OWNER>/reporting-backend:latest
+    image: ghcr.io/EgHz23/reporting-backend:latest
     container_name: reporting-scheduler
     env_file:
       - .env
@@ -67,7 +67,7 @@ services:
       - avichron-net
 
   frontend:
-    image: ghcr.io/<OWNER>/reporting-frontend:latest
+    image: ghcr.io/EgHz23/reporting-frontend:latest
     container_name: reporting-frontend
     environment:
       TZ: Europe/Ljubljana
@@ -85,12 +85,11 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:Z
-      - ./nginx/ssl:/etc/ssl
+      - ./conf.d:/etc/nginx/conf.d:Z
+      - ./ssl:/etc/ssl
     depends_on:
       - backend
       - frontend
-      # - doc-summarizer
     restart: unless-stopped
     networks:
       - avichron-net
