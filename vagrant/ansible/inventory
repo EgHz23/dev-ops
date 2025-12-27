@@ -1,2 +1,3 @@
 [reportvm]
-127.0.0.1 ansible_connection=local
+# 127.0.0.1 ansible_connection=local
+209.38.199.229 ansible_user=devops

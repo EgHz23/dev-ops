@@ -2,32 +2,44 @@
   become: true
 
   vars:
-    # Kje je docker-compose projekt na VM (Vagrant synced folder)
-    compose_project_dir: "/vagrant/infra"
+    # Where the dev-ops repo will live on the VM
+    app_root: "/opt/reportapp"
+
+    # Your dev-ops repo URL (recommended: public repo without secrets)
+    # If private, use SSH deploy key or token via Ansible Vault / env var.
+    repo_url: "https://github.com/EgHz23/dev-ops.git"
+    repo_version: "main"
+
+    # Where docker-compose project is on the VM
+    # Expecting: /opt/reportapp/infra/docker-compose.yml, /opt/reportapp/infra/conf.d/default.conf, ...
+    compose_project_dir: "{{ app_root }}/vagrant/infra"
 
     # Timezone
     tz: "Europe/Ljubljana"
 
-    # TLS (za nginx container – volume z self-signed certom)
+    # GHCR auth (best practice: pass GHCR_TOKEN via environment)
+    ghcr_username: "eghz23"
+    ghcr_token: "{{ lookup('ansible.builtin.env', 'GHCR_TOKEN') | default('ghp_TOKEN', true) }}"
+
+    # TLS (self-signed cert, mounted into nginx container)
     ssl_dir: "{{ compose_project_dir }}/ssl"
     ssl_cert: "{{ ssl_dir }}/cert.pem"
     ssl_key: "{{ ssl_dir }}/private.key"
 
-    # Volume direktoriji (morajo obstajati, če jih uporablja docker-compose.yml)
+    # Bind-mount directories for app data / config
     audit_logs_dir: "{{ compose_project_dir }}/audit-logs"
     generated_reports_dir: "{{ compose_project_dir }}/generated-reports"
-    pgdata_dir: "{{ compose_project_dir }}/backup/pgdata"
     nginx_conf_dir: "{{ compose_project_dir }}/conf.d"
 
   tasks:
     # ----------------------------------------------------------------------
-    # OS osnovna nastavitev
+    # OS base setup
     # ----------------------------------------------------------------------
     - name: Nastavi timezone
       timezone:
         name: "{{ tz }}"
 
-    - name: Namesti osnovne pakete (git, ca-certificates, curl, gnupg)
+    - name: Namesti osnovne pakete (git, ca-certificates, curl, gnupg, openssl)
       apt:
         name:
           - git
@@ -35,27 +47,26 @@
           - curl
           - gnupg
           - lsb-release
+          - openssl
         state: present
         update_cache: yes
 
     # ----------------------------------------------------------------------
-    # Namestitev Docker + Docker Compose plugin
+    # Docker Engine + Compose plugin + Buildx
     # ----------------------------------------------------------------------
-    - name: Dodaj Docker GPG key
-      ansible.builtin.shell: |
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        chmod a+r /etc/apt/keyrings/docker.gpg
-      args:
-        executable: /bin/bash
-      register: docker_gpg
-      changed_when: docker_gpg.rc == 0
+#    - name: Dodaj Docker GPG key
+#      ansible.builtin.shell: |
+#        install -m 0755 -d /etc/apt/keyrings
+#        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+#        chmod a+r /etc/apt/keyrings/docker.gpg
+#      args:
+#        executable: /bin/bash
 
-    - name: Dodaj Docker repo
+    - name: Dodaj Docker repo (Ubuntu 22.04 Jammy, amd64)
       copy:
         dest: /etc/apt/sources.list.d/docker.list
         content: |
-          deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") $(lsb_release -cs) stable
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu jammy stable
 
     - name: Namesti Docker engine in compose plugin
       apt:
@@ -75,9 +86,39 @@
         enabled: true
 
     # ----------------------------------------------------------------------
-    # Priprava volume direktorijev, ki jih uporablja docker-compose.yml
+    # Pull Infra-as-Code repo onto VM (so infra/ exists here)
     # ----------------------------------------------------------------------
-    - name: Ustvari volume direktorije (logs, reports, pgdata, nginx conf/ssl)
+    - name: Ustvari app root direktorij
+      file:
+        path: "{{ app_root }}"
+        state: directory
+        mode: "0755"
+
+    - name: Kloniraj ali posodobi dev-ops repo (Infra as Code)
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_root }}"
+        version: "{{ repo_version }}"
+        force: yes
+        update: yes
+
+    - name: Fail if repo content is missing (docker-compose + nginx conf)
+      stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ compose_project_dir }}/docker-compose.yml"
+        - "{{ nginx_conf_dir }}/default.conf"
+      register: required_files
+
+    - name: Abort if required files are missing
+      fail:
+        msg: "Repo content not present on VM. Missing: {{ required_files.results | selectattr('stat.exists','equalto',false) | map(attribute='item') | list }}"
+      when: required_files.results | selectattr('stat.exists','equalto',false) | list | length > 0
+
+    # ----------------------------------------------------------------------
+    # Ensure expected directories exist BEFORE files are created
+    # ----------------------------------------------------------------------
+    - name: Ustvari direktorije (logs, reports, nginx conf, ssl)
       file:
         path: "{{ item }}"
         state: directory
@@ -85,29 +126,33 @@
       loop:
         - "{{ audit_logs_dir }}"
         - "{{ generated_reports_dir }}"
-        - "{{ pgdata_dir }}"
         - "{{ nginx_conf_dir }}"
         - "{{ ssl_dir }}"
 
+    - name: Ustvari prazno .env datoteko, če še ne obstaja
+      copy:
+        dest: "{{ compose_project_dir }}/.env"
+        content: ""
+        force: no
+        mode: "0600"
+
     # ----------------------------------------------------------------------
-    # Preveri, da nginx conf datoteke obstajajo v infra/conf.d
+    # Validate nginx configs exist in repo
     # ----------------------------------------------------------------------
     - name: Preveri, da nginx conf datoteke obstajajo
       stat:
         path: "{{ nginx_conf_dir }}/{{ item }}"
       loop:
         - default.conf
-        # če timeout.conf ne obstaja, odstrani to linijo ali ga dodaj v repo
-        # - timeout.conf
       register: nginx_conf_files
 
     - name: Fail, če nginx conf datoteke manjkajo
       fail:
-        msg: "Manjkajo nginx conf datoteke v {{ nginx_conf_dir }} (default.conf, timeout.conf?)."
+        msg: "Manjkajo nginx conf datoteke v {{ nginx_conf_dir }} (default.conf)."
       when: nginx_conf_files.results | selectattr('stat.exists', 'equalto', false) | list | length > 0
 
     # ----------------------------------------------------------------------
-    # TLS: self-signed cert za nginx (mount v containerju)
+    # TLS: self-signed cert for nginx (mounted into container)
     # ----------------------------------------------------------------------
     - name: Ustvari self-signed TLS cert, če še ne obstaja
       shell: |
@@ -123,7 +168,7 @@
         executable: /bin/bash
 
     # ----------------------------------------------------------------------
-    # Docker Compose: pull & up celotnega stacka
+    # Docker Compose: pull & up
     # ----------------------------------------------------------------------
     - name: Preveri, da docker-compose.yml obstaja
       stat:
@@ -132,8 +177,15 @@
 
     - name: Fail, če docker-compose.yml ne obstaja
       fail:
-        msg: "Datoteka {{ compose_project_dir }}/docker-compose.yml ne obstaja. Poskrbi, da je v infra/."
+        msg: "Datoteka {{ compose_project_dir }}/docker-compose.yml ne obstaja. Preveri repo strukturo."
       when: not compose_file.stat.exists
+
+    - name: Prijava v GHCR registry
+      ansible.builtin.command: >
+        docker login ghcr.io
+        -u {{ ghcr_username }}
+        -p {{ ghcr_token }}
+      no_log: true
 
     - name: docker compose pull (potegni zadnje image iz registry - CI/CD del)
       ansible.builtin.command: docker compose pull

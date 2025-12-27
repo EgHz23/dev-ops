@@ -10,7 +10,7 @@ services:
       POSTGRES_DB: reporting_db
       TZ: Europe/Ljubljana
     volumes:
-      - ./backup/pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U Admin -d reporting_db"]
       interval: 5s
@@ -23,8 +23,9 @@ services:
           - postgres
 
   backend:
-    image: ghcr.io/EgHz23/reporting-backend:latest
+    image: ghcr.io/eghz23/reporting-backend:latest
     container_name: reporting-backend
+    # env_file zahteva, da /vagrant/infra/.env obstaja
     env_file:
       - .env
     environment:
@@ -35,6 +36,18 @@ services:
       WEB_THREADS: "2"
       GUNICORN_TIMEOUT: "900"
       ZABBIX_SUPPRESS_TLS_WARNINGS: "1"
+      LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED}
+      LOCAL_JWT_SECRET: ${LOCAL_JWT_SECRET}
+      LOCAL_JWT_ISSUER: ${LOCAL_JWT_ISSUER}
+      LOCAL_JWT_AUDIENCE: ${LOCAL_JWT_AUDIENCE}
+      LOCAL_ADMIN_USERNAME: ${LOCAL_ADMIN_USERNAME}
+      LOCAL_ADMIN_PASSWORD: ${LOCAL_ADMIN_PASSWORD}
+      LOCAL_ADMIN_PASSWORD_HASH: ${LOCAL_ADMIN_PASSWORD_HASH}
+      LOCAL_ADMIN_EMAIL: ${LOCAL_ADMIN_EMAIL}
+      LOCAL_ADMIN_NAME: ${LOCAL_ADMIN_NAME}
+      FERNET_KEY: ${FERNET_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      PROXY_TRUSTED_HOSTS: ${PROXY_TRUSTED_HOSTS}
     volumes:
       - ./audit-logs:/app/logs
       - ./generated-reports:/app/generated_reports
@@ -45,7 +58,7 @@ services:
       - avichron-net
 
   scheduler:
-    image: ghcr.io/EgHz23/reporting-backend:latest
+    image: ghcr.io/eghz23/reporting-backend:latest
     container_name: reporting-scheduler
     env_file:
       - .env
@@ -54,6 +67,18 @@ services:
       RUN_SCHEDULER: "1"
       SCHEDULER_MAX_CONCURRENCY: "3"
       DATABASE_URL: postgresql://Admin:harvey7298@postgres:5432/reporting_db
+      LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED}
+      LOCAL_JWT_SECRET: ${LOCAL_JWT_SECRET}
+      LOCAL_JWT_ISSUER: ${LOCAL_JWT_ISSUER}
+      LOCAL_JWT_AUDIENCE: ${LOCAL_JWT_AUDIENCE}
+      LOCAL_ADMIN_USERNAME: ${LOCAL_ADMIN_USERNAME}
+      LOCAL_ADMIN_PASSWORD: ${LOCAL_ADMIN_PASSWORD}
+      LOCAL_ADMIN_PASSWORD_HASH: ${LOCAL_ADMIN_PASSWORD_HASH}
+      LOCAL_ADMIN_EMAIL: ${LOCAL_ADMIN_EMAIL}
+      LOCAL_ADMIN_NAME: ${LOCAL_ADMIN_NAME}
+      FERNET_KEY: ${FERNET_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      PROXY_TRUSTED_HOSTS: ${PROXY_TRUSTED_HOSTS}
     command: >
       bash -lc "python -c \"import asyncio; from services.scheduler import scheduler;
       asyncio.run(scheduler.run_scheduler())\""
@@ -67,11 +92,10 @@ services:
       - avichron-net
 
   frontend:
-    image: ghcr.io/EgHz23/reporting-frontend:latest
+    image: ghcr.io/eghz23/reporting-frontend:latest
     container_name: reporting-frontend
     environment:
       TZ: Europe/Ljubljana
-      # frontend talks to backend via nginx (/api), not directly
     restart: unless-stopped
     networks:
       - avichron-net
@@ -97,3 +121,6 @@ services:
 networks:
   avichron-net:
     driver: bridge
+
+volumes:
+  pgdata
