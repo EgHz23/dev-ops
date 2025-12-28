@@ -361,6 +361,11 @@ Pipeline vključuje:
 
     <img width="558" height="248" alt="image" src="https://github.com/user-attachments/assets/44c2502d-150b-4321-b385-89ace1dd0e49" />
 
+  - Build and push:
+
+  <img width="1843" height="839" alt="image" src="https://github.com/user-attachments/assets/12eacfc7-0bde-4170-b525-5f54c8d1ce67" />
+
+
 ## Javni dostop (deployment)
 
 Aplikacija je dostopna na:  https://avichron.com/
